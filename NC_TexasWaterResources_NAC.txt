@@ -1,0 +1,173 @@
+/*
+===============
+ NAC
+===============
+
+Date Created: March 10, 2019
+
+The NAC code takes collections of Landsat 5 TM, Landsat 7 ETM+, and Landsat 8 OLI data in a specified boundary and from 1986 to 2016 and combines it into one merged collection.
+In this process, it also applies a correction to make Landsat 8 OLI data more comparable to Landsat 5 TM and Landsat 7 ETM+ data. Each dataset is also masked to remove cloud cover
+using the QA bands in each dataset. This merged collection of data is then used to calculate the maximum NDVI value for each month within each year. This results in a collection of single
+band NDVI images with 2 properties associated with each file: month and year. This is collection of monthly NDVI maximums for each year from 1986 to 2016 is then used to
+calculate the mean NDVI maximum for each month across all years. This collection of mean NDVI maximums for each month is then exported to Google Drive at a 30 meter resolution.
+
+
+ Parameters
+-------------
+1. Import the shapefile of your area of interest as a Google Earth Engine Asset
+2. Modify the variable "shape" to point to the correct location to load in the converted shapefile (ex: shape = ee.FeatureCollection("users/account_name_here/asset_name_here")
+3. Modify the "Map.setCenter()" to center on the shapefile. This may take trial and error or calling a Google Earth Engine function.
+
+
+ Contact
+---------
+Name(s): Anna Stamatogiannakis
+E-mail(s): annastamatog@gmail.com 
+===============
+*/
+
+//NAC (NDVI Anomaly Calculation) Code:
+
+// Load in Landsat 5, Landsat 7, Landsat 8, and the shapefile for the city of interest
+// USER: Import your desired shapefile, then 1) uncomment the last line in this section and insert your asset path,
+// eg: shape = ee.FeatureCollection("user/folder/shapefile"), 2) also comment out shape = austin;
+var l5 = ee.ImageCollection("LANDSAT/LT05/C01/T1_SR"),
+    l8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR"),
+    l7 = ee.ImageCollection("LANDSAT/LE07/C01/T1_SR"),
+    shape = austin; // comment this out if you use the next line
+    //shape = ee.FeatureCollection("users/missoudisastersiii/austin_shape");
+
+// Center the map on the geographic center of shapefile, zoom to appropriate level
+Map.setCenter(-97.71, 30.28, 10);
+Map.addLayer(shape);
+
+// Create date, bounds, and cloud cover filters
+var date_filter = ee.Filter.date('1986-01-01', '2016-12-30');
+var bounds_filter = ee.Filter.bounds(shape);
+var date_bounds = ee.Filter.and(bounds_filter, date_filter);
+
+// Create function which clips to extent of shapefile
+var shape_clip = function (image){
+  return image.clip(shape);
+};
+
+// Create function which masks cloudcover out of Landsat 8 OLI images
+function maskL8sr(image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  // Get the pixel QA band.
+  var qa = image.select('pixel_qa');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// Create a function which masks out cloud pixels from Landsat 5 and 7 imagery
+var cloudMaskL457 = function(image) {
+  var qa = image.select('pixel_qa');
+  // If the cloud bit (5) is set and the cloud confidence (7) is high
+  // or the cloud shadow bit is set (3), then it's a bad pixel.
+  var cloud = qa.bitwiseAnd(1 << 5)
+                  .and(qa.bitwiseAnd(1 << 7))
+                  .or(qa.bitwiseAnd(1 << 3));
+  // Remove edge pixels that don't occur in all bands
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  return image.updateMask(cloud.not()).updateMask(mask2);
+};
+
+// Create mergeCollection function to merge together all available Landsat imagery (L5, L7, L8)
+var mergeCollection = function() {
+    // list the bands as described in the metadata for Landsat 5 and 7
+    var l5names = ee.List(["B1","B2","B3","B4","B5","B6","B7"]);
+    var l7names = ee.List(["B1","B2","B3","B4","B5","B6","B7"]);
+     
+    // list the common band names which will allow us to easily merge the bands and calculate NDVI
+    var l5Bands = ee.List(['blue','green','red','nir','swir1','thermal1','swir2']);
+    var l7Bands = ee.List(['blue','green','red','nir','swir1','thermal1', 'swir2']);
+    
+    // create NDVI function
+    var makeNDVI = function(image){
+      var NDVI = image.normalizedDifference(['nir', 'red']).rename('NDVI');
+      return image.addBands(NDVI);
+      };
+      
+    // create function to 'harmonize' Landsat 8 and other Landsat collections for more direct comparison of NDVI values
+    var OLI2TM = function(oli){
+      var slopes = ee.Image.constant([0.9785, 0.9542, 0.9825, 1.0073, 1.0171, 0.9949]);
+      var itcp = ee.Image.constant([-0.0095, -0.0016, -0.0022, -0.0021, -0.0030, 0.0029]);
+      var y = oli.select(['B2','B3','B4','B5','B6','B7'], ['blue','green','red','nir','swir1','swir2']) // change l8 bands to common band names for use in NDVI calculation
+        .subtract(itcp.multiply(10000)).divide(slopes)
+        .set('system:time_start', oli.get('system:time_start'));
+      return y.toShort();
+    };
+    
+    // apply 'harmonizing' function and cloudmask function to Landsat 8 collection
+    var l8_clean = l8.map(maskL8sr);
+    var l8_corrected = l8_clean.map(OLI2TM);
+    var l8images = l8_corrected.filter(date_bounds).map(makeNDVI); // apply filter to Landsat 8 collection and create an NDVI band
+    
+    // apply cloud mask to Landsat 5 collection
+    var l5_clean = l5.map(cloudMaskL457);
+    var l5_named = l5_clean.select(l5names, l5Bands); // rename bands for use in NDVI calculation
+    var l5images = l5_named.filter(date_bounds).map(makeNDVI); // apply filter to Landsat 5 collection and create NDVI band
+   
+    // apply cloud mask to Landsat 7 collection
+    var l7_clean = l7.map(cloudMaskL457);
+    var l7_named = l7_clean.select(l7names, l7Bands); // rename bands for use in NDVI calculation
+    var l7images = l7_named.filter(date_bounds).map(makeNDVI); // apply filter to Landsat 7 collection and create NDVI band
+
+    // create image collection of all Landsat images  
+    var myCollection = ee.ImageCollection(l5images.merge(l7images.merge(l8images)));
+      return myCollection;
+};
+
+// get a merged collection of all available Landsat surface reflectance tier 1 quality imagery, clip to shapefile extent
+var LandsatCollection = mergeCollection().map(shape_clip);
+
+// create a collection of NDVI maximum values per month per year
+var months = ee.List.sequence(1, 12);
+var years = ee.List.sequence(1986, 2016);
+var byMonthYear = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    return months.map(function (m) {
+      return LandsatCollection
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .select('NDVI')
+        .max()
+        .set('month', m).set('year', y);
+  });
+}).flatten());
+
+// filter out images which do not contain any bands from collection
+var nullimages = byMonthYear
+    .map(function(image) {
+      return image.set('count', image.bandNames().length());
+    })
+    .filter(ee.Filter.eq('count', 1));
+
+// apply reducer to get NDVI mean for each month (ie establish an NDVI norm for each month)
+var ndviNorm = ee.ImageCollection.fromImages(
+  months.map(function(m) {
+    return nullimages.filter(ee.Filter.eq('month', m))
+    .mean()
+    .set('month', m);
+  })
+);
+
+
+// export all NDVI norm images to EE Assets using a for loop
+// USER: Uncomment Map.addLayer(export_image); line to visualize each NDVI layer in GEE.
+for (var m=1; m<=12; m=m+1) {
+  var export_image = ndviNorm.filter(ee.Filter.eq('month', m)).first();
+  var desc = ee.String('NDVI_Norm_Austin_').cat(ee.String(ee.Number(m))).getInfo();
+  //Map.addLayer(export_image);
+  Export.image.toAsset({
+    image: export_image,
+    description: desc,
+    scale: 30,
+    maxPixels: 1e13
+  });
+}
